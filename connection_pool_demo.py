@@ -112,6 +112,10 @@ class PooledConnection:
         except:
             return False
     
+    def is_expired(self, ttl_seconds: float) -> bool:
+        """Check if the connection has exceeded its TTL based on last usage"""
+        return (time.time() - self.last_used) > ttl_seconds
+    
     def close(self):
         """Close the underlying socket"""
         try:
@@ -122,10 +126,11 @@ class PooledConnection:
 class SimpleConnectionPool:
     """Simple connection pool implementation"""
     
-    def __init__(self, host: str, port: int, max_connections: int = 5):
+    def __init__(self, host: str, port: int, max_connections: int = 5, connection_ttl: float = 300.0):
         self.host = host
         self.port = port
         self.max_connections = max_connections
+        self.connection_ttl = connection_ttl  # TTL in seconds (default: 5 minutes)
         
         # Available connections waiting to be used
         self.available_connections = queue.Queue()
@@ -138,28 +143,44 @@ class SimpleConnectionPool:
         self.borrowed_connections = set()
         self.borrowed_lock = threading.Lock()
         
+        # Background cleanup thread
+        self.cleanup_running = True
+        self.cleanup_thread = threading.Thread(target=self._cleanup_expired_connections, daemon=True)
+        self.cleanup_thread.start()
+        
     def get_connection(self, timeout: float = 5.0) -> Optional[PooledConnection]:
         """Get a connection from the pool"""
         print(f"Pool: Requesting connection (available: {self.available_connections.qsize()}, "
               f"total: {len(self.all_connections)})")
         
-        # Try to get an available connection first
-        try:
-            conn = self.available_connections.get_nowait()
-            if conn.is_alive():
-                print(f"Pool: Reusing existing connection {id(conn.socket)}")
-                conn.in_use = True
-                conn.last_used = time.time()
-                with self.borrowed_lock:
-                    self.borrowed_connections.add(conn)
-                return conn
-            else:
-                print(f"Pool: Connection {id(conn.socket)} is dead, discarding")
-                self._remove_connection(conn)
-        except queue.Empty:
-            pass
+        start_time = time.time()
         
-        # No available connection - try to create a new one
+        # Keep trying to get a valid connection from available ones
+        # this seems like a bad way to implement this...
+        # what's best practice for when all threads are in use?
+        # should we immediately try to create a new one if we're not at capacity?
+        while time.time() - start_time < timeout:
+            try:
+                conn = self.available_connections.get_nowait()
+                if conn.is_expired(self.connection_ttl):
+                    print(f"Pool: Connection {id(conn.socket)} expired (idle: {time.time() - conn.last_used:.1f}s), discarding")
+                    self._remove_connection(conn)
+                    continue  # Try to get another connection
+                elif conn.is_alive():
+                    print(f"Pool: Reusing existing connection {id(conn.socket)}")
+                    conn.in_use = True
+                    conn.last_used = time.time()
+                    with self.borrowed_lock:
+                        self.borrowed_connections.add(conn)
+                    return conn
+                else:
+                    print(f"Pool: Connection {id(conn.socket)} is dead, discarding")
+                    self._remove_connection(conn)
+                    continue  # Try to get another connection
+            except queue.Empty:
+                break  # No more available connections
+        
+        # No valid available connection - try to create a new one
         with self.all_connections_lock:
             if len(self.all_connections) < self.max_connections:
                 conn = self._create_new_connection()
@@ -173,9 +194,18 @@ class SimpleConnectionPool:
         
         # Pool is full - wait for a connection to be returned
         print("Pool: Pool is full, waiting for available connection...")
+        remaining_timeout = timeout - (time.time() - start_time)
+        if remaining_timeout <= 0:
+            print("Pool: Timeout waiting for connection")
+            return None
+            
         try:
-            conn = self.available_connections.get(timeout=timeout)
-            if conn.is_alive():
+            conn = self.available_connections.get(timeout=remaining_timeout)
+            if conn.is_expired(self.connection_ttl):
+                print(f"Pool: Connection {id(conn.socket)} expired (idle: {time.time() - conn.last_used:.1f}s), discarding")
+                self._remove_connection(conn)
+                return None
+            elif conn.is_alive():
                 with self.borrowed_lock:
                     self.borrowed_connections.add(conn)
                 conn.in_use = True
@@ -200,7 +230,10 @@ class SimpleConnectionPool:
         conn.in_use = False
         conn.last_used = time.time()
         
-        if conn.is_alive():
+        if conn.is_expired(self.connection_ttl):
+            print(f"Pool: Connection {id(conn.socket)} expired (idle: {time.time() - conn.last_used:.1f}s), removing from pool")
+            self._remove_connection(conn)
+        elif conn.is_alive():
             self.available_connections.put(conn)
         else:
             print(f"Pool: Connection {id(conn.socket)} died, removing from pool")
@@ -231,13 +264,54 @@ class SimpleConnectionPool:
         with self.all_connections_lock:
             self.all_connections.discard(conn)
     
+    def _cleanup_expired_connections(self):
+        """Background thread to clean up expired connections"""
+        while self.cleanup_running:
+            try:
+                time.sleep(30)  # Check every 30 seconds
+                
+                # Check available connections one by one without draining the entire queue
+                queue_size = self.available_connections.qsize()
+                expired_connections = []
+                
+                # Only check existing connections, don't wait for new ones
+                for _ in range(queue_size):
+                    try:
+                        conn = self.available_connections.get_nowait()
+                        if conn.is_expired(self.connection_ttl):
+                            expired_connections.append(conn)
+                        else:
+                            # Put back non-expired connection immediately
+                            self.available_connections.put(conn)
+                    except queue.Empty:
+                        break
+                
+                # Remove expired connections
+                for conn in expired_connections:
+                    print(f"Pool: Background cleanup removing expired connection {id(conn.socket)} (idle: {time.time() - conn.last_used:.1f}s)")
+                    self._remove_connection(conn)
+                    
+            except Exception as e:
+                print(f"Pool: Cleanup thread error: {e}")
+    
+    def shutdown(self):
+        """Shutdown the connection pool and cleanup resources"""
+        print("Pool: Shutting down connection pool")
+        self.cleanup_running = False
+        
+        # Close all connections
+        with self.all_connections_lock:
+            for conn in self.all_connections.copy():
+                self._remove_connection(conn)
+    
     def get_stats(self):
         """Get pool statistics"""
         return {
             "total_connections": len(self.all_connections),
             "available_connections": self.available_connections.qsize(),
             "borrowed_connections": len(self.borrowed_connections),
-            "max_connections": self.max_connections
+            "max_connections": self.max_connections,
+            "connection_ttl": self.connection_ttl
         }
 
 # =============================================================================
@@ -248,7 +322,8 @@ class ServiceA:
     """Client service that uses connection pool to talk to ServiceB"""
     
     def __init__(self, service_b_host='localhost', service_b_port=8080):
-        self.pool = SimpleConnectionPool(service_b_host, service_b_port, max_connections=3)
+        # Use a shorter TTL for testing (10 seconds)
+        self.pool = SimpleConnectionPool(service_b_host, service_b_port, max_connections=3, connection_ttl=10.0)
     
     def make_request(self, request_data: str) -> Optional[str]:
         """Make a request to ServiceB using the connection pool"""
@@ -330,6 +405,31 @@ def main():
         t.join()
     
     print(f"\nFinal pool stats: {service_a.get_pool_stats()}")
+    
+    print("\n=== Testing TTL functionality ===")
+    print("Waiting 12 seconds to test connection expiration (TTL is 10 seconds)...")
+    
+    # Make a request to create a connection
+    response = service_a.make_request("/ttl-test")
+    if response:
+        data = json.loads(response)
+        print(f"Initial TTL test request: connection {data.get('connection_id')}")
+    
+    print(f"Pool stats after initial request: {service_a.get_pool_stats()}")
+    
+    # Wait for connections to expire
+    time.sleep(12)
+    
+    # Make another request - should create a new connection since old ones expired
+    response = service_a.make_request("/ttl-test-after-expiry")
+    if response:
+        data = json.loads(response)
+        print(f"Request after TTL expiry: connection {data.get('connection_id')}")
+    
+    print(f"Pool stats after TTL expiry: {service_a.get_pool_stats()}")
+    
+    # Shutdown the pool cleanly
+    service_a.pool.shutdown()
 
 if __name__ == "__main__":
     main()
