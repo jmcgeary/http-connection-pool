@@ -1,6 +1,6 @@
 # HTTP Connection Pool
 
-Educational implementation of an HTTP connection pool in Python, demonstrating key concepts of connection pooling and thread-safe resource management.
+I was interested in how http connections pools are implemented, so I went through this exercise of building one in Python.
 
 ## Features
 
